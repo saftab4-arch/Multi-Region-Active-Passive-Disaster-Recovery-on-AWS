@@ -1,0 +1,323 @@
+# Project 4: Multi-Region Active-Passive Disaster Recovery on AWS
+
+A production-grade Multi-Region Active-Passive Disaster Recovery architecture built entirely from scratch via the AWS Console. This project demonstrates how enterprise companies protect against full region failures using Transit Gateway inter-region peering, Route 53 automatic DNS failover, and S3 Cross-Region Replication.
+
+**Primary Region:** us-east-1 (N. Virginia)  
+**DR Region:** us-west-2 (Oregon)  
+**Primary VPC CIDR:** 10.0.0.0/16  
+**DR VPC CIDR:** 10.2.0.0/16  
+
+---
+
+## Architecture Diagram
+
+```
+                              INTERNET
+                                 │
+                    ┌────────────┴────────────┐
+                    │                         │
+              [Route 53]               [Route 53]
+           Health Check ping        Failover DNS Policy
+           every 30 seconds         www.project4demo.internal
+                    │                         │
+         ┌──────────▼──────────┐   ┌──────────▼──────────┐
+         │    us-east-1        │   │    us-west-2         │
+         │    PRIMARY ✅       │   │    DR STANDBY ⏸️     │
+         │                     │   │                      │
+         │  ┌───────────────┐  │   │  ┌───────────────┐  │
+         │  │  project4-    │  │   │  │  project4-    │  │
+         │  │  primary-vpc  │  │   │  │  dr-vpc       │  │
+         │  │  10.0.0.0/16  │  │   │  │  10.2.0.0/16  │  │
+         │  │               │  │   │  │               │  │
+         │  │ ┌───────────┐ │  │   │  │ ┌───────────┐ │  │
+         │  │ │  public   │ │  │   │  │ │  public   │ │  │
+         │  │ │  subnet   │ │  │   │  │ │  subnet   │ │  │
+         │  │ │10.0.1.0/24│ │  │   │  │ │10.2.1.0/24│ │  │
+         │  │ │           │ │  │   │  │ │           │ │  │
+         │  │ │  ┌──────┐ │ │  │   │  │ │  ┌──────┐ │ │  │
+         │  │ │  │ EC2  │ │ │  │   │  │ │  │ EC2  │ │ │  │
+         │  │ │  │ Web  │ │ │  │   │  │ │  │ Web  │ │ │  │
+         │  │ │  │Server│ │ │  │   │  │ │  │Server│ │ │  │
+         │  │ │  │ :80  │ │ │  │   │  │ │  │ :80  │ │ │  │
+         │  │ │  └──────┘ │ │  │   │  │ │  └──────┘ │ │  │
+         │  │ └───────────┘ │  │   │  │ └───────────┘ │  │
+         │  │               │  │   │  │               │  │
+         │  │ ┌───────────┐ │  │   │  │ ┌───────────┐ │  │
+         │  │ │  Transit  │ │  │   │  │ │  Transit  │ │  │
+         │  │ │  Gateway  │◄├──┼───┼──┼─┤  Gateway  │ │  │
+         │  │ │  ASN 64512│ │  │   │  │ │  ASN 64513│ │  │
+         │  │ └───────────┘ │  │   │  │ └───────────┘ │  │
+         │  └───────────────┘  │   │  └───────────────┘  │
+         │         │           │   │          │           │
+         │    [IGW primary]    │   │    [IGW dr]          │
+         └─────────────────────┘   └──────────────────────┘
+                   ▲                          ▲
+                   │    TGW Inter-Region      │
+                   │    Peering Tunnel        │
+                   └──────────────────────────┘
+                        AWS Private Backbone
+                        (not public internet)
+
+         ┌─────────────────────────────────────────────┐
+         │              S3 Cross-Region Replication     │
+         │                                             │
+         │  project4-primary-bucket-syed  ──────────►  │
+         │        us-east-1 (source)      auto-copy    │
+         │                                             │
+         │  project4-dr-bucket-syed                    │
+         │        us-west-2 (replica)                  │
+         └─────────────────────────────────────────────┘
+
+FAILOVER FLOW:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Normal:   User → Route 53 → Primary EC2 (us-east-1) ✅
+Disaster: Primary EC2 stops → Health check fails (3x)
+          Route 53 detects Unhealthy → switches DNS
+          User → Route 53 → DR EC2 (us-west-2) ✅
+          Zero manual intervention. Automatic.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+---
+
+## What I Built & Why
+
+### Phase 1 — Primary Region (us-east-1)
+
+#### VPC — project4-primary-vpc (10.0.0.0/16)
+The isolated network for the primary region. We use `10.0.0.0/16` for primary and `10.2.0.0/16` for DR — different CIDRs are critical. When we peer the two Transit Gateways later, overlapping CIDRs would cause routing conflicts and the peering would fail.
+
+#### Public Subnet — 10.0.1.0/24 (us-east-1a)
+One subnet is enough for this project. The EC2 web server lives here with a public IP so Route 53 health checks can reach it from the internet on port 80.
+
+#### Internet Gateway — project4-primary-igw
+The front door between the VPC and the internet. Without it, the Route 53 health checker (which comes from the public internet) cannot reach the EC2 on port 80 — health checks would immediately fail even with the EC2 running perfectly.
+
+#### Route Table — project4-primary-rt
+Routes `0.0.0.0/0` to the IGW and associated with the public subnet. This is what makes the subnet "public" — without this route, the EC2 has no internet path.
+
+#### EC2 Web Server — project4-primary-web
+Runs Apache with a simple HTML page: "Hello from PRIMARY - us-east-1". The User Data script installs Apache automatically on first boot:
+
+```bash
+#!/bin/bash
+yum update -y
+yum install -y httpd
+systemctl start httpd
+systemctl enable httpd
+echo "<h1>Hello from PRIMARY - us-east-1</h1>" > /var/www/html/index.html
+```
+
+Why this page? During the failover test you need to visually confirm which region is serving traffic. Without distinct pages, you can't tell if failover actually happened.
+
+Security group `project4-primary-sg`:
+- SSH (22) from 0.0.0.0/0 — management access
+- HTTP (80) from 0.0.0.0/0 — web traffic + Route 53 health checks
+
+#### Transit Gateway — project4-primary-tgw (ASN 64512)
+The backbone router for the primary region. Think of TGW as a hub airport — instead of direct flights between every city pair, everything connects through one central hub. TGW allows you to connect many VPCs without a mesh of VPC peering connections.
+
+Why ASN 64512? ASN (Autonomous System Number) is a unique ID for BGP routing. When we peer two TGWs, BGP uses these numbers to identify which network is which. The range 64512-65534 is reserved for private use — like 192.168.x.x for private IPs. Each TGW needs a different ASN or BGP refuses to establish the peering.
+
+#### TGW VPC Attachment — project4-primary-tgw-attach
+Creating a TGW alone does nothing. You must explicitly attach each VPC to it — like plugging a cable into a router. Without this attachment the TGW has no idea the VPC exists.
+
+---
+
+### Phase 2 — DR Region (us-west-2)
+
+Mirror of Phase 1 built in Oregon. Every resource is identical except:
+- VPC CIDR is `10.2.0.0/16` (different from primary to avoid conflicts)
+- EC2 page says "Hello from DR - us-west-2"
+- TGW ASN is `64513` (different from primary's 64512)
+
+The DR region runs 24/7 in standby — it's always on, always healthy, receiving zero traffic under normal conditions. When disaster strikes, it's already running and ready to serve immediately. No cold start, no scrambling.
+
+---
+
+### Phase 3 — TGW Inter-Region Peering
+
+#### Why TGW Peering Instead of VPC Peering?
+You cannot directly peer VPCs across regions with simple VPC peering in a TGW-routed architecture. TGW inter-region peering is the proper enterprise pattern — traffic stays on the AWS private backbone, never touching the public internet. Faster, cheaper at scale, and more secure.
+
+#### Peering Attachment — project4-tgw-peer
+Created from us-east-1, targeting the DR TGW in us-west-2. AWS requires manual acceptance from the other side — a security measure so nobody can peer into your TGW without explicit approval. Like accepting a friend request.
+
+#### Static Routes — why we need them
+The peering tunnel being "Available" doesn't mean traffic flows automatically. The TGW still needs to know WHERE to send traffic. Without static routes:
+```
+Packet arrives at primary TGW destined for 10.2.x.x
+TGW checks route table → no entry → packet dropped ❌
+```
+
+With static routes:
+```
+Primary TGW: 10.2.0.0/16 → peering tunnel (exit us-east-1)
+DR TGW:      10.0.0.0/16 → VPC attachment (enter DR VPC)
+```
+
+Why different attachments on each side?
+- Primary TGW's next hop = peering tunnel (to cross the region boundary)
+- DR TGW's next hop = VPC attachment (traffic already crossed, now deliver into VPC)
+
+Think of it like a package:
+```
+FedEx picks it up (primary TGW → peering tunnel)
+Local driver delivers it to your door (DR TGW → VPC attachment)
+```
+
+---
+
+### Phase 4 — Route 53 Health Check + Failover DNS
+
+#### Health Check — project4-primary-health
+Pings primary EC2 port 80 every 30 seconds from multiple AWS regions worldwide. Failure threshold of 3 means it must fail 3 consecutive checks before marking unhealthy — prevents false alarms from brief network blips.
+
+#### Hosted Zone — project4demo.internal
+A public hosted zone that acts as the DNS phone book for our demo domain. We use a fake internal domain since this is a lab — no real domain purchase needed.
+
+#### Failover DNS Records
+Two A records for the same domain `www.project4demo.internal`:
+
+| Record | Type | Value | Policy | Health Check |
+|---|---|---|---|---|
+| Primary | A | 13.220.43.41 | Failover - Primary | project4-primary-health |
+| Secondary | A | 35.93.201.4 | Failover - Secondary | None |
+
+How it works:
+- Normal: Route 53 serves primary record → traffic goes to us-east-1
+- Failure: Health check flips Unhealthy → Route 53 automatically serves secondary → traffic goes to us-west-2
+- Recovery: Primary comes back healthy → Route 53 switches back automatically
+- Zero manual intervention at any point
+
+TTL of 60 seconds means DNS changes propagate within 1 minute.
+
+---
+
+### Phase 5 — S3 Cross-Region Replication
+
+#### Why Versioning is Required
+AWS mandates bucket versioning for CRR. Versioning tracks every version of every object — CRR uses this to identify what's new and needs replicating. Without versioning enabled on both buckets, the replication rule creation fails.
+
+#### CRR Rule — project4-crr-rule
+Any object uploaded to `project4-primary-bucket-syed` in us-east-1 automatically replicates to `project4-dr-bucket-syed` in us-west-2. AWS auto-created an IAM role (`s3crr_role_for_project4-primary-bucket-syed`) with the exact permissions needed for replication.
+
+Result: Data is always safe in two separate regions. Even if us-east-1 burns down completely, every file already exists in Oregon.
+
+---
+
+## Mistakes Made & How I Fixed Them
+
+### 1. Launched primary EC2 without User Data
+Forgot to paste the Apache installation script in the User Data field during launch. You can't add User Data to a running instance. Fixed by SSH-ing into the instance and running the commands manually:
+```bash
+sudo yum install -y httpd
+sudo systemctl start httpd
+sudo systemctl enable httpd
+echo "<h1>Hello from PRIMARY - us-east-1</h1>" | sudo tee /var/www/html/index.html
+```
+
+### 2. Created primary S3 bucket in wrong region
+Accidentally created `project4-primary-bucket-syed` in us-west-2 instead of us-east-1. S3 doesn't allow region changes after creation. Fixed by emptying the bucket, deleting it, and recreating it in the correct region (us-east-1).
+
+### 3. nslookup timing out for project4demo.internal
+Tried to verify DNS failover using nslookup from local laptop. The AWS internal resolver `169.254.169.253` only works from inside an EC2 instance — it's a link-local address not reachable from outside AWS. Used Route 53 console health check status as proof of failover instead.
+
+---
+
+## Results — End-to-End Verification
+
+### ✅ Test 1 — Primary Web Server Accessible
+```
+http://13.220.43.41 → "Hello from PRIMARY - us-east-1"
+```
+Proves: VPC, IGW, route table, EC2, Apache all working in us-east-1.
+
+### ✅ Test 2 — DR Web Server Accessible
+```
+http://35.93.201.4 → "Hello from DR - us-west-2"
+```
+Proves: Mirror architecture in us-west-2 fully functional and ready.
+
+### ✅ Test 3 — TGW Inter-Region Peering Available
+Both TGW attachments showing Available status. Private tunnel between us-east-1 and us-west-2 established on AWS backbone.
+
+### ✅ Test 4 — Route 53 Health Check Healthy
+Health check pinging primary EC2 port 80 from multiple global locations — all returning green.
+
+### ✅ Test 5 — S3 Cross-Region Replication Working
+Uploaded `test.txt` to primary bucket in us-east-1. Within 2 minutes the same file appeared automatically in DR bucket in us-west-2. Data is always protected across two regions.
+
+### ✅ Test 6 — Failover Test (Money Shot)
+```
+Action: Stopped project4-primary-web EC2 in us-east-1
+Result: Route 53 health check flipped to Unhealthy after ~90 seconds
+Effect: Route 53 automatically serving secondary DNS record
+        All traffic now routing to DR EC2 in us-west-2
+Manual intervention required: ZERO
+```
+
+---
+
+## Traffic Flow Summary
+
+```
+NORMAL OPERATIONS:
+User → Route 53 (health check green) → Primary EC2 us-east-1
+                                        "Hello from PRIMARY"
+
+DISASTER (primary EC2 down):
+Route 53 health check pings port 80 → no response (x3)
+Route 53 marks primary Unhealthy
+Route 53 automatically serves secondary DNS record
+User → Route 53 → DR EC2 us-west-2
+                  "Hello from DR"
+Zero manual steps. Fully automatic.
+
+TGW INTER-REGION PRIVATE ROUTING:
+Primary VPC (10.0.x.x) → Primary TGW → peering tunnel
+                                        (AWS private backbone)
+                       → DR TGW → DR VPC attachment → DR VPC (10.2.x.x)
+
+S3 REPLICATION:
+Upload to primary bucket (us-east-1)
+→ CRR rule triggers automatically
+→ Object copied to DR bucket (us-west-2)
+→ Data safe in two regions at all times
+```
+
+---
+
+## Key Concepts
+
+**What is Active-Passive DR?**
+Active = primary region serving 100% of traffic.
+Passive = DR region running and healthy but receiving zero traffic.
+On failure, passive becomes active automatically. Contrast with Active-Active where both regions serve traffic simultaneously — more complex, more expensive.
+
+**RPO and RTO**
+RPO (Recovery Point Objective) = how much data can you lose? With S3 CRR replicating continuously, RPO approaches zero — data is always in both regions.
+RTO (Recovery Time Objective) = how long to recover? With Route 53 automatic failover, RTO is under 3 minutes — the time for 3 failed health checks plus DNS TTL propagation. No human needed.
+
+**Why TGW inter-region peering over VPN?**
+Site-to-Site VPN between regions is another option but requires managing VPN tunnels, BGP configuration, and has bandwidth limitations. TGW inter-region peering is managed by AWS, scales automatically, and routes over the AWS private backbone which is more reliable than VPN over the public internet.
+
+**Why different CIDRs between regions?**
+When two VPCs/networks are connected (via TGW peering), their IP ranges must not overlap. If both used 10.0.0.0/16, the TGW wouldn't know which region to route a packet destined for 10.0.1.5 — it could be in either region. Different CIDRs eliminate this ambiguity completely.
+
+---
+
+## Cleanup Order
+1. Route 53 → delete health check
+2. Route 53 → delete both A records → delete hosted zone
+3. S3 → empty both buckets → delete both buckets
+4. us-east-1: Delete TGW peering attachment
+5. us-east-1: Delete TGW VPC attachment
+6. us-east-1: Delete project4-primary-tgw
+7. us-west-2: Delete TGW VPC attachment
+8. us-west-2: Delete project4-dr-tgw
+9. us-east-1: Terminate project4-primary-web EC2
+10. us-west-2: Terminate project4-dr-web EC2
+11. us-east-1: Delete route table, detach + delete IGW, delete subnet, delete VPC
+12. us-west-2: Delete route table, detach + delete IGW, delete subnet, delete VPC
+13. IAM → delete s3crr role auto-created by CRR
